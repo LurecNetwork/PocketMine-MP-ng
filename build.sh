@@ -13,7 +13,7 @@ echo -e "${AQUA}Downloading PHP binary...${NC}"
 curl -s -L https://github.com/pmmp/PHP-Binaries/releases/download/php-8.2-latest/PHP-Linux-x86_64-PM5.tar.gz | tar -xz > /dev/null 2>&1
 
 echo -e "${AQUA}Installing dependencies...${NC}"
-/workspaces/PocketMine-MP-ng/bin/php7/bin/php /usr/local/bin/composer install > /dev/null 2>&1
+/workspaces/PocketMine-MP-ng/bin/php7/bin/php /usr/local/bin/composer install --no-dev --classmap-authoritative > /dev/null 2>&1
 
 if [ -f "PocketMine-MP.phar" ]; then
     echo -e "${RED}Removing current PocketMine-MP.phar...${NC}"
