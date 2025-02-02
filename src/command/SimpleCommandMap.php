@@ -64,6 +64,7 @@ use pocketmine\command\defaults\TransferServerCommand;
 use pocketmine\command\defaults\VanillaCommand;
 use pocketmine\command\defaults\VersionCommand;
 use pocketmine\command\defaults\WhitelistCommand;
+use pocketmine\command\defaults\XpCommand;
 use pocketmine\command\utils\CommandStringHelper;
 use pocketmine\command\utils\InvalidCommandSyntaxException;
 use pocketmine\lang\KnownTranslationFactory;
@@ -72,6 +73,7 @@ use pocketmine\timings\Timings;
 use pocketmine\utils\TextFormat;
 use pocketmine\utils\Utils;
 use function array_shift;
+use function array_values;
 use function count;
 use function implode;
 use function str_contains;
@@ -132,7 +134,8 @@ class SimpleCommandMap implements CommandMap{
 			new TitleCommand(),
 			new TransferServerCommand(),
 			new VersionCommand(),
-			new WhitelistCommand()
+			new WhitelistCommand(),
+			new XpCommand(),
 		]);
 	}
 
@@ -161,7 +164,7 @@ class SimpleCommandMap implements CommandMap{
 				unset($aliases[$index]);
 			}
 		}
-		$command->setAliases($aliases);
+		$command->setAliases(array_values($aliases));
 
 		if(!$registered){
 			$command->setLabel($fallbackPrefix . ":" . $label);
