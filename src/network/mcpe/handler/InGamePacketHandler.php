@@ -27,7 +27,6 @@ use pocketmine\block\BaseSign;
 use pocketmine\block\Lectern;
 use pocketmine\block\tile\Sign;
 use pocketmine\block\utils\SignText;
-use pocketmine\entity\animation\ConsumingItemAnimation;
 use pocketmine\entity\Attribute;
 use pocketmine\entity\InvalidSkinException;
 use pocketmine\event\player\PlayerEditBookEvent;
@@ -44,6 +43,8 @@ use pocketmine\math\Facing;
 use pocketmine\math\Vector3;
 use pocketmine\nbt\tag\CompoundTag;
 use pocketmine\nbt\tag\StringTag;
+use pocketmine\network\FilterNoisyPacketException;
+use pocketmine\network\mcpe\convert\ItemTranslator;
 use pocketmine\network\mcpe\InventoryManager;
 use pocketmine\network\mcpe\NetworkSession;
 use pocketmine\network\mcpe\protocol\ActorEventPacket;
@@ -76,6 +77,7 @@ use pocketmine\network\mcpe\protocol\PlayerAuthInputPacket;
 use pocketmine\network\mcpe\protocol\PlayerHotbarPacket;
 use pocketmine\network\mcpe\protocol\PlayerInputPacket;
 use pocketmine\network\mcpe\protocol\PlayerSkinPacket;
+use pocketmine\network\mcpe\protocol\ProtocolInfo;
 use pocketmine\network\mcpe\protocol\RequestChunkRadiusPacket;
 use pocketmine\network\mcpe\protocol\serializer\BitSet;
 use pocketmine\network\mcpe\protocol\ServerSettingsRequestPacket;
@@ -85,12 +87,12 @@ use pocketmine\network\mcpe\protocol\ShowCreditsPacket;
 use pocketmine\network\mcpe\protocol\SpawnExperienceOrbPacket;
 use pocketmine\network\mcpe\protocol\SubClientLoginPacket;
 use pocketmine\network\mcpe\protocol\TextPacket;
-use pocketmine\network\mcpe\protocol\types\ActorEvent;
 use pocketmine\network\mcpe\protocol\types\BlockPosition;
 use pocketmine\network\mcpe\protocol\types\inventory\ContainerIds;
 use pocketmine\network\mcpe\protocol\types\inventory\MismatchTransactionData;
 use pocketmine\network\mcpe\protocol\types\inventory\NetworkInventoryAction;
 use pocketmine\network\mcpe\protocol\types\inventory\NormalTransactionData;
+use pocketmine\network\mcpe\protocol\types\inventory\PredictedResult;
 use pocketmine\network\mcpe\protocol\types\inventory\ReleaseItemTransactionData;
 use pocketmine\network\mcpe\protocol\types\inventory\stackrequest\ItemStackRequest;
 use pocketmine\network\mcpe\protocol\types\inventory\stackresponse\ItemStackResponse;
@@ -128,6 +130,7 @@ use const JSON_THROW_ON_ERROR;
  * This handler handles packets related to general gameplay.
  */
 class InGamePacketHandler extends PacketHandler{
+	private const MAX_FORM_RESPONSE_SIZE = 10 * 1024; //10 KiB should be more than enough
 	private const MAX_FORM_RESPONSE_DEPTH = 2; //modal/simple will be 1, custom forms 2 - they will never contain anything other than string|int|float|bool|null
 
 	protected float $lastRightClickTime = 0.0;
@@ -137,6 +140,8 @@ class InGamePacketHandler extends PacketHandler{
 	protected ?float $lastPlayerAuthInputYaw = null;
 	protected ?float $lastPlayerAuthInputPitch = null;
 	protected ?BitSet $lastPlayerAuthInputFlags = null;
+
+	protected ?BlockPosition $lastBlockAttacked = null;
 
 	public bool $forceMoveSync = false;
 
@@ -213,20 +218,19 @@ class InGamePacketHandler extends PacketHandler{
 		}
 
 		$inputFlags = $packet->getInputFlags();
-		if($inputFlags !== $this->lastPlayerAuthInputFlags){
+		if($this->lastPlayerAuthInputFlags === null || !$inputFlags->equals($this->lastPlayerAuthInputFlags)){
 			$this->lastPlayerAuthInputFlags = $inputFlags;
 
-			$sneaking = $inputFlags->get(PlayerAuthInputFlags::SNEAKING);
-			if($this->player->isSneaking() === $sneaking){
-				$sneaking = null;
-			}
+			$sneakPressed = $inputFlags->get(PlayerAuthInputFlags::SNEAKING);
+
+			$sneaking = $this->resolveOnOffInputFlags($inputFlags, PlayerAuthInputFlags::START_SNEAKING, PlayerAuthInputFlags::STOP_SNEAKING);
 			$sprinting = $this->resolveOnOffInputFlags($inputFlags, PlayerAuthInputFlags::START_SPRINTING, PlayerAuthInputFlags::STOP_SPRINTING);
 			$swimming = $this->resolveOnOffInputFlags($inputFlags, PlayerAuthInputFlags::START_SWIMMING, PlayerAuthInputFlags::STOP_SWIMMING);
 			$gliding = $this->resolveOnOffInputFlags($inputFlags, PlayerAuthInputFlags::START_GLIDING, PlayerAuthInputFlags::STOP_GLIDING);
 			$flying = $this->resolveOnOffInputFlags($inputFlags, PlayerAuthInputFlags::START_FLYING, PlayerAuthInputFlags::STOP_FLYING);
 			$crawling = $this->resolveOnOffInputFlags($inputFlags, PlayerAuthInputFlags::START_CRAWLING, PlayerAuthInputFlags::STOP_CRAWLING);
 			$mismatch =
-				($sneaking !== null && !$this->player->toggleSneak($sneaking)) |
+				(!$this->player->toggleSneak($sneaking ?? $this->player->isSneaking(), $sneakPressed)) |
 				($sprinting !== null && !$this->player->toggleSprint($sprinting)) |
 				($swimming !== null && !$this->player->toggleSwim($swimming)) |
 				($gliding !== null && !$this->player->toggleGlide($gliding)) |
@@ -252,6 +256,28 @@ class InGamePacketHandler extends PacketHandler{
 
 		$packetHandled = true;
 
+		$useItemTransaction = $packet->getItemInteractionData();
+		if($useItemTransaction !== null){
+			if(count($useItemTransaction->getTransactionData()->getActions()) > 100){
+				throw new PacketHandlingException("Too many actions in item use transaction");
+			}
+
+			$this->inventoryManager->setCurrentItemStackRequestId($useItemTransaction->getRequestId());
+			$this->inventoryManager->addRawPredictedSlotChanges($useItemTransaction->getTransactionData()->getActions());
+			if(!$this->handleUseItemTransaction($useItemTransaction->getTransactionData())){
+				$packetHandled = false;
+				$this->session->getLogger()->debug("Unhandled transaction in PlayerAuthInputPacket (type " . $useItemTransaction->getTransactionData()->getActionType() . ")");
+			}else{
+				$this->inventoryManager->syncMismatchedPredictedSlotChanges();
+			}
+			$this->inventoryManager->setCurrentItemStackRequestId(null);
+		}
+
+		$itemStackRequest = $packet->getItemStackRequest();
+		$itemStackResponseBuilder = $itemStackRequest !== null ? $this->handleSingleItemStackRequest($itemStackRequest) : null;
+
+		//itemstack request or transaction may set predictions for the outcome of these actions, so these need to be
+		//processed last
 		$blockActions = $packet->getBlockActions();
 		if($blockActions !== null){
 			if(count($blockActions) > 100){
@@ -272,51 +298,16 @@ class InGamePacketHandler extends PacketHandler{
 			}
 		}
 
-		$useItemTransaction = $packet->getItemInteractionData();
-		if($useItemTransaction !== null){
-			if(count($useItemTransaction->getTransactionData()->getActions()) > 100){
-				throw new PacketHandlingException("Too many actions in item use transaction");
-			}
-
-			$this->inventoryManager->setCurrentItemStackRequestId($useItemTransaction->getRequestId());
-			$this->inventoryManager->addRawPredictedSlotChanges($useItemTransaction->getTransactionData()->getActions());
-			if(!$this->handleUseItemTransaction($useItemTransaction->getTransactionData())){
-				$packetHandled = false;
-				$this->session->getLogger()->debug("Unhandled transaction in PlayerAuthInputPacket (type " . $useItemTransaction->getTransactionData()->getActionType() . ")");
-			}else{
-				$this->inventoryManager->syncMismatchedPredictedSlotChanges();
-			}
-			$this->inventoryManager->setCurrentItemStackRequestId(null);
-		}
-
-		$itemStackRequest = $packet->getItemStackRequest();
 		if($itemStackRequest !== null){
-			$result = $this->handleSingleItemStackRequest($itemStackRequest);
-			$this->session->sendDataPacket(ItemStackResponsePacket::create([$result]));
+			$itemStackResponse = $itemStackResponseBuilder?->build() ?? new ItemStackResponse(ItemStackResponse::RESULT_ERROR, $itemStackRequest->getRequestId());
+			$this->session->sendDataPacket(ItemStackResponsePacket::create([$itemStackResponse]));
 		}
 
 		return $packetHandled;
 	}
 
 	public function handleActorEvent(ActorEventPacket $packet) : bool{
-		if($packet->actorRuntimeId !== $this->player->getId()){
-			//TODO HACK: EATING_ITEM is sent back to the server when the server sends it for other players (1.14 bug, maybe earlier)
-			return $packet->actorRuntimeId === ActorEvent::EATING_ITEM;
-		}
-
-		switch($packet->eventId){
-			case ActorEvent::EATING_ITEM: //TODO: ignore this and handle it server-side
-				$item = $this->player->getInventory()->getItemInHand();
-				if($item->isNull()){
-					return false;
-				}
-				$this->player->broadcastAnimation(new ConsumingItemAnimation($this->player, $this->player->getInventory()->getItemInHand()));
-				break;
-			default:
-				return false;
-		}
-
-		return true;
+		return true; //not used
 	}
 
 	public function handleInventoryTransaction(InventoryTransactionPacket $packet) : bool{
@@ -487,7 +478,7 @@ class InGamePacketHandler extends PacketHandler{
 				$this->lastRightClickData = $data;
 				$this->lastRightClickTime = microtime(true);
 				if($spamBug){
-					return true;
+					throw new FilterNoisyPacketException();
 				}
 				//TODO: end hack for client spam bug
 
@@ -495,19 +486,21 @@ class InGamePacketHandler extends PacketHandler{
 
 				$blockPos = $data->getBlockPosition();
 				$vBlockPos = new Vector3($blockPos->getX(), $blockPos->getY(), $blockPos->getZ());
-				if(!$this->player->interactBlock($vBlockPos, $data->getFace(), $clickPos)){
-					//always sync this in case plugins caused a different result than the client expected
-					//we *could* try to enhance detection of plugin-altered behaviour, but this would require propagating
-					//more information up the stack. For now I think this is good enough.
-					//if only the client would tell us what blocks it thinks changed...
-					$this->syncBlocksNearby($vBlockPos, $data->getFace());
-				}
-				return true;
-			case UseItemTransactionData::ACTION_BREAK_BLOCK:
-				$blockPos = $data->getBlockPosition();
-				$vBlockPos = new Vector3($blockPos->getX(), $blockPos->getY(), $blockPos->getZ());
-				if(!$this->player->breakBlock($vBlockPos)){
-					$this->syncBlocksNearby($vBlockPos, null);
+				$this->player->interactBlock($vBlockPos, $data->getFace(), $clickPos);
+				if($this->player->getNetworkSession()->getProtocolId() < ProtocolInfo::PROTOCOL_1_21_20 || $data->getClientInteractPrediction() === PredictedResult::SUCCESS){
+					//If the item has an associated blockstate ID, this means it will only place one block.
+					//We can avoid syncing the adjacent blocks of the place position in this case, since that's only
+					//necessary if there might be multiple blocks around the placement location affected.
+					//Adjacents of the clicked block are still always synced, since it's too complicated to figure out
+					//if the client might've predicted something in this case. However, since the clicked block is always
+					//"behind" the placed block, this shouldn't affect bridging or fast placement.
+					//This would be much easier if the client would just tell us which blocks it thinks changed...
+					$syncAdjacentFace = null;
+					if($data->getItemInHand()->getItemStack()->getBlockRuntimeId() === ItemTranslator::NO_BLOCK_RUNTIME_ID){
+						$this->session->getLogger()->debug("Placing held item might place multiple blocks client-side; doing full adjacent sync");
+						$syncAdjacentFace = $data->getFace();
+					}
+					$this->syncBlocksNearby($vBlockPos, $syncAdjacentFace);
 				}
 				return true;
 			case UseItemTransactionData::ACTION_CLICK_AIR:
@@ -516,6 +509,10 @@ class InGamePacketHandler extends PacketHandler{
 						$hungerAttr = $this->player->getAttributeMap()->get(Attribute::HUNGER) ?? throw new AssumptionFailedError();
 						$hungerAttr->markSynchronized(false);
 					}
+					//TODO: workaround goat horns getting stuck in the "using item" state
+					//this timed-trigger behaviour is also used for other items apart from food
+					//in the future we'll generalise this logic and add proper hooks for it
+					$this->player->setUsingItem(false);
 					return true;
 				}
 				$this->player->useHeldItem();
@@ -556,7 +553,9 @@ class InGamePacketHandler extends PacketHandler{
 
 	private function handleUseItemOnEntityTransaction(UseItemOnEntityTransactionData $data) : bool{
 		$target = $this->player->getWorld()->getEntity($data->getActorRuntimeId());
-		if($target === null){
+		//TODO: HACK! We really shouldn't be keeping disconnected players (and generally flagged-for-despawn entities)
+		//in the world's entity table, but changing that is too risky for a hotfix. This workaround will do for now.
+		if($target === null || $target->isFlaggedForDespawn()){
 			return false;
 		}
 
@@ -585,7 +584,7 @@ class InGamePacketHandler extends PacketHandler{
 		return false;
 	}
 
-	private function handleSingleItemStackRequest(ItemStackRequest $request) : ItemStackResponse{
+	private function handleSingleItemStackRequest(ItemStackRequest $request) : ?ItemStackResponseBuilder{
 		if(count($request->getActions()) > 60){
 			//recipe book auto crafting can affect all slots of the inventory when consuming inputs or producing outputs
 			//this means there could be as many as 50 CraftingConsumeInput actions or Place (taking the result) actions
@@ -602,7 +601,11 @@ class InGamePacketHandler extends PacketHandler{
 		$executor = new ItemStackRequestExecutor($this->player, $this->inventoryManager, $request);
 		try{
 			$transaction = $executor->generateInventoryTransaction();
-			$result = $this->executeInventoryTransaction($transaction, $request->getRequestId());
+			if($transaction !== null){
+				$result = $this->executeInventoryTransaction($transaction, $request->getRequestId());
+			}else{
+				$result = true; //predictions only, just send responses
+			}
 		}catch(ItemStackRequestProcessException $e){
 			$result = false;
 			$this->session->getLogger()->debug("ItemStackRequest #" . $request->getRequestId() . " failed: " . $e->getMessage());
@@ -610,10 +613,7 @@ class InGamePacketHandler extends PacketHandler{
 			$this->inventoryManager->requestSyncAll();
 		}
 
-		if(!$result){
-			return new ItemStackResponse(ItemStackResponse::RESULT_ERROR, $request->getRequestId());
-		}
-		return $executor->buildItemStackResponse();
+		return $result ? $executor->getItemStackResponseBuilder() : null;
 	}
 
 	public function handleItemStackRequest(ItemStackRequestPacket $packet) : bool{
@@ -623,7 +623,7 @@ class InGamePacketHandler extends PacketHandler{
 			throw new PacketHandlingException("Too many requests in ItemStackRequestPacket");
 		}
 		foreach($packet->getRequests() as $request){
-			$responses[] = $this->handleSingleItemStackRequest($request);
+			$responses[] = $this->handleSingleItemStackRequest($request)?->build() ?? new ItemStackResponse(ItemStackResponse::RESULT_ERROR, $request->getRequestId());
 		}
 
 		$this->session->sendDataPacket(ItemStackResponsePacket::create($responses));
@@ -686,16 +686,27 @@ class InGamePacketHandler extends PacketHandler{
 
 		switch($action){
 			case PlayerAction::START_BREAK:
+			case PlayerAction::CONTINUE_DESTROY_BLOCK: //destroy the next block while holding down left click
 				self::validateFacing($face);
+				if($this->lastBlockAttacked !== null && $blockPosition->equals($this->lastBlockAttacked)){
+					//the client will send CONTINUE_DESTROY_BLOCK for the currently targeted block directly before it
+					//sends PREDICT_DESTROY_BLOCK, but also when it starts to break the block
+					//this seems like a bug in the client and would cause spurious left-click events if we allowed it to
+					//be delivered to the player
+					$this->session->getLogger()->debug("Ignoring PlayerAction $action on $pos because we were already destroying this block");
+					break;
+				}
 				if(!$this->player->attackBlock($pos, $face)){
 					$this->syncBlocksNearby($pos, $face);
 				}
+				$this->lastBlockAttacked = $blockPosition;
 
 				break;
 
 			case PlayerAction::ABORT_BREAK:
 			case PlayerAction::STOP_BREAK:
 				$this->player->stopBreakBlock($pos);
+				$this->lastBlockAttacked = null;
 				break;
 			case PlayerAction::START_SLEEPING:
 				//unused
@@ -706,11 +717,19 @@ class InGamePacketHandler extends PacketHandler{
 			case PlayerAction::CRACK_BREAK:
 				self::validateFacing($face);
 				$this->player->continueBreakBlock($pos, $face);
+				$this->lastBlockAttacked = $blockPosition;
 				break;
 			case PlayerAction::INTERACT_BLOCK: //TODO: ignored (for now)
 				break;
 			case PlayerAction::CREATIVE_PLAYER_DESTROY_BLOCK:
-				//TODO: do we need to handle this?
+				//in server auth block breaking, we get PREDICT_DESTROY_BLOCK anyway, so this action is redundant
+				break;
+			case PlayerAction::PREDICT_DESTROY_BLOCK:
+				self::validateFacing($face);
+				if(!$this->player->breakBlock($pos)){
+					$this->syncBlocksNearby($pos, $face);
+				}
+				$this->lastBlockAttacked = null;
 				break;
 			case PlayerAction::START_ITEM_USE_ON:
 			case PlayerAction::STOP_ITEM_USE_ON:
@@ -731,7 +750,9 @@ class InGamePacketHandler extends PacketHandler{
 	}
 
 	public function handleAnimate(AnimatePacket $packet) : bool{
-		return true; //Not used
+		//this spams harder than a firehose on left click if "Improved Input Response" is enabled, and we don't even
+		//use it anyway :<
+		throw new FilterNoisyPacketException();
 	}
 
 	public function handleContainerClose(ContainerClosePacket $packet) : bool{
@@ -747,6 +768,43 @@ class InGamePacketHandler extends PacketHandler{
 		return true; //this is a broken useless packet, so we don't use it
 	}
 
+	/**
+	 * @throws PacketHandlingException
+	 */
+	private function updateSignText(CompoundTag $nbt, string $tagName, bool $frontFace, BaseSign $block, Vector3 $pos) : bool{
+		$textTag = $nbt->getTag($tagName);
+		if(!$textTag instanceof CompoundTag){
+			throw new PacketHandlingException("Invalid tag type " . get_debug_type($textTag) . " for tag \"$tagName\" in sign update data");
+		}
+		$textBlobTag = $textTag->getTag(Sign::TAG_TEXT_BLOB);
+		if(!$textBlobTag instanceof StringTag){
+			throw new PacketHandlingException("Invalid tag type " . get_debug_type($textBlobTag) . " for tag \"" . Sign::TAG_TEXT_BLOB . "\" in sign update data");
+		}
+
+		try{
+			$text = SignText::fromBlob($textBlobTag->getValue());
+		}catch(\InvalidArgumentException $e){
+			throw PacketHandlingException::wrap($e, "Invalid sign text update");
+		}
+
+		$oldText = $block->getFaceText($frontFace);
+		if($text->getLines() === $oldText->getLines()){
+			return false;
+		}
+
+		try{
+			if(!$block->updateFaceText($this->player, $frontFace, $text)){
+				foreach($this->player->getWorld()->createBlockUpdatePackets($this->session->getTypeConverter(), [$pos]) as $updatePacket){
+					$this->session->sendDataPacket($updatePacket);
+				}
+				return false;
+			}
+			return true;
+		}catch(\UnexpectedValueException $e){
+			throw PacketHandlingException::wrap($e);
+		}
+	}
+
 	public function handleBlockActorData(BlockActorDataPacket $packet) : bool{
 		$pos = new Vector3($packet->blockPosition->getX(), $packet->blockPosition->getY(), $packet->blockPosition->getZ());
 		if($pos->distanceSquared($this->player->getLocation()) > 10000){
@@ -758,29 +816,9 @@ class InGamePacketHandler extends PacketHandler{
 		if(!($nbt instanceof CompoundTag)) throw new AssumptionFailedError("PHPStan should ensure this is a CompoundTag"); //for phpstorm's benefit
 
 		if($block instanceof BaseSign){
-			$frontTextTag = $nbt->getTag(Sign::TAG_FRONT_TEXT);
-			if(!$frontTextTag instanceof CompoundTag){
-				throw new PacketHandlingException("Invalid tag type " . get_debug_type($frontTextTag) . " for tag \"" . Sign::TAG_FRONT_TEXT . "\" in sign update data");
-			}
-			$textBlobTag = $frontTextTag->getTag(Sign::TAG_TEXT_BLOB);
-			if(!$textBlobTag instanceof StringTag){
-				throw new PacketHandlingException("Invalid tag type " . get_debug_type($textBlobTag) . " for tag \"" . Sign::TAG_TEXT_BLOB . "\" in sign update data");
-			}
-
-			try{
-				$text = SignText::fromBlob($textBlobTag->getValue());
-			}catch(\InvalidArgumentException $e){
-				throw PacketHandlingException::wrap($e, "Invalid sign text update");
-			}
-
-			try{
-				if(!$block->updateText($this->player, $text)){
-					foreach($this->player->getWorld()->createBlockUpdatePackets($this->session->getTypeConverter(), [$pos]) as $updatePacket){
-						$this->session->sendDataPacket($updatePacket);
-					}
-				}
-			}catch(\UnexpectedValueException $e){
-				throw PacketHandlingException::wrap($e);
+			if(!$this->updateSignText($nbt, Sign::TAG_FRONT_TEXT, true, $block, $pos)){
+				//only one side can be updated at a time
+				$this->updateSignText($nbt, Sign::TAG_BACK_TEXT, false, $block, $pos);
 			}
 
 			return true;
@@ -977,6 +1015,13 @@ class InGamePacketHandler extends PacketHandler{
 			//TODO: make APIs for this to allow plugins to use this information
 			return $this->player->onFormSubmit($packet->formId, null);
 		}elseif($packet->formData !== null){
+			if(strlen($packet->formData) > self::MAX_FORM_RESPONSE_SIZE){
+				throw new PacketHandlingException("Form response data too large, refusing to decode (received" . strlen($packet->formData) . " bytes, max " . self::MAX_FORM_RESPONSE_SIZE . " bytes)");
+			}
+			if(!$this->player->hasPendingForm($packet->formId)){
+				$this->session->getLogger()->debug("Got unexpected response for form $packet->formId");
+				return false;
+			}
 			try{
 				$responseData = json_decode($packet->formData, true, self::MAX_FORM_RESPONSE_DEPTH, JSON_THROW_ON_ERROR);
 			}catch(\JsonException $e){

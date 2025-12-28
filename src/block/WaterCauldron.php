@@ -27,6 +27,7 @@ use pocketmine\block\tile\Cauldron as TileCauldron;
 use pocketmine\block\utils\DyeColor;
 use pocketmine\color\Color;
 use pocketmine\entity\Entity;
+use pocketmine\event\entity\EntityExtinguishEvent;
 use pocketmine\item\Armor;
 use pocketmine\item\Banner;
 use pocketmine\item\Dye;
@@ -122,7 +123,7 @@ final class WaterCauldron extends FillableCauldron{
 			$world->addSound($this->position->add(0.5, 0.5, 0.5), new CauldronAddDyeSound());
 
 			$item->pop();
-		}elseif($item instanceof Potion || $item instanceof SplashPotion){ //TODO: lingering potion
+		}elseif($item instanceof Potion || $item instanceof SplashPotion){
 			if($item->getType() === PotionType::WATER){
 				$this->setCustomWaterColor(null)->addFillLevels(self::WATER_BOTTLE_FILL_AMOUNT, $item, VanillaItems::GLASS_BOTTLE(), $returnedItems);
 			}else{
@@ -183,7 +184,7 @@ final class WaterCauldron extends FillableCauldron{
 
 	public function onEntityInside(Entity $entity) : bool{
 		if($entity->isOnFire()){
-			$entity->extinguish();
+			$entity->extinguish(EntityExtinguishEvent::CAUSE_WATER_CAULDRON);
 			//TODO: particles
 
 			$this->position->getWorld()->setBlock($this->position, $this->withFillLevel($this->getFillLevel() - self::ENTITY_EXTINGUISH_USE_AMOUNT));

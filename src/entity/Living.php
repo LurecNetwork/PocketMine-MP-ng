@@ -38,6 +38,7 @@ use pocketmine\event\entity\EntityDamageByChildEntityEvent;
 use pocketmine\event\entity\EntityDamageByEntityEvent;
 use pocketmine\event\entity\EntityDamageEvent;
 use pocketmine\event\entity\EntityDeathEvent;
+use pocketmine\event\entity\EntityFrostWalkerEvent;
 use pocketmine\inventory\ArmorInventory;
 use pocketmine\inventory\CallbackInventoryListener;
 use pocketmine\inventory\Inventory;
@@ -61,6 +62,7 @@ use pocketmine\network\mcpe\protocol\types\entity\EntityMetadataProperties;
 use pocketmine\player\Player;
 use pocketmine\timings\Timings;
 use pocketmine\utils\Binary;
+use pocketmine\utils\Limits;
 use pocketmine\utils\Utils;
 use pocketmine\world\sound\BurpSound;
 use pocketmine\world\sound\EntityLandSound;
@@ -180,8 +182,7 @@ abstract class Living extends Entity{
 
 		$this->setAirSupplyTicks($nbt->getShort(self::TAG_BREATH_TICKS, self::DEFAULT_BREATH_TICKS));
 
-		/** @var CompoundTag[]|ListTag|null $activeEffectsTag */
-		$activeEffectsTag = $nbt->getListTag(self::TAG_ACTIVE_EFFECTS);
+		$activeEffectsTag = $nbt->getListTag(self::TAG_ACTIVE_EFFECTS, CompoundTag::class);
 		if($activeEffectsTag !== null){
 			foreach($activeEffectsTag as $e){
 				$effect = EffectIdMap::getInstance()->fromId($e->getByte(self::TAG_EFFECT_ID));
@@ -189,12 +190,14 @@ abstract class Living extends Entity{
 					continue;
 				}
 
+				$duration = $e->getInt(self::TAG_EFFECT_DURATION);
 				$this->effectManager->add(new EffectInstance(
 					$effect,
-					$e->getInt(self::TAG_EFFECT_DURATION),
+					$duration === -1 ? Limits::INT32_MAX : $duration,
 					Binary::unsignByte($e->getByte(self::TAG_EFFECT_AMPLIFIER)),
 					$e->getByte(self::TAG_EFFECT_SHOW_PARTICLES, 1) !== 0,
-					$e->getByte(self::TAG_EFFECT_AMBIENT, 0) !== 0
+					$e->getByte(self::TAG_EFFECT_AMBIENT, 0) !== 0,
+					infinite: $duration === -1
 				));
 			}
 		}
@@ -239,6 +242,10 @@ abstract class Living extends Entity{
 
 	public function setAbsorption(float $absorption) : void{
 		$this->absorptionAttr->setValue($absorption);
+	}
+
+	public function getSneakOffset() : float{
+		return 0.0;
 	}
 
 	public function isSneaking() : bool{
@@ -291,7 +298,7 @@ abstract class Living extends Entity{
 			$width = $size->getWidth();
 			$this->setSize((new EntitySizeInfo($width, $width, $width * 0.9))->scale($this->getScale()));
 		}elseif($this->isSneaking()){
-			$this->setSize((new EntitySizeInfo(3 / 4 * $size->getHeight(), $size->getWidth(), 3 / 4 * $size->getEyeHeight()))->scale($this->getScale()));
+			$this->setSize((new EntitySizeInfo($size->getHeight() - $this->getSneakOffset(), $size->getWidth(), $size->getEyeHeight() - $this->getSneakOffset()))->scale($this->getScale()));
 		}else{
 			$this->setSize($size->scale($this->getScale()));
 		}
@@ -317,7 +324,7 @@ abstract class Living extends Entity{
 				$effects[] = CompoundTag::create()
 					->setByte(self::TAG_EFFECT_ID, EffectIdMap::getInstance()->toId($effect->getType()))
 					->setByte(self::TAG_EFFECT_AMPLIFIER, Binary::signByte($effect->getAmplifier()))
-					->setInt(self::TAG_EFFECT_DURATION, $effect->getDuration())
+					->setInt(self::TAG_EFFECT_DURATION, $effect->isInfinite() ? -1 : $effect->getDuration())
 					->setByte(self::TAG_EFFECT_AMBIENT, $effect->isAmbient() ? 1 : 0)
 					->setByte(self::TAG_EFFECT_SHOW_PARTICLES, $effect->isVisible() ? 1 : 0);
 			}
@@ -721,19 +728,30 @@ abstract class Living extends Entity{
 		$y = $this->location->getFloorY() - 1;
 		$baseZ = $this->location->getFloorZ();
 
-		$frostedIce = VanillaBlocks::FROSTED_ICE();
+		$liquid = VanillaBlocks::WATER();
+		$targetBlock = VanillaBlocks::FROSTED_ICE();
+		if(EntityFrostWalkerEvent::hasHandlers()){
+			$ev = new EntityFrostWalkerEvent($this, $radius, $liquid, $targetBlock);
+			$ev->call();
+			if($ev->isCancelled()){
+				return;
+			}
+			$radius = $ev->getRadius();
+			$liquid = $ev->getLiquid();
+			$targetBlock = $ev->getTargetBlock();
+		}
+
 		for($x = $baseX - $radius; $x <= $baseX + $radius; $x++){
 			for($z = $baseZ - $radius; $z <= $baseZ + $radius; $z++){
 				$block = $world->getBlockAt($x, $y, $z);
 				if(
-					!$block instanceof Water ||
-					!$block->isSource() ||
+					!$block->isSameState($liquid) ||
 					$world->getBlockAt($x, $y + 1, $z)->getTypeId() !== BlockTypeIds::AIR ||
 					count($world->getNearbyEntities(AxisAlignedBB::one()->offset($x, $y, $z))) !== 0
 				){
 					continue;
 				}
-				$world->setBlockAt($x, $y, $z, $frostedIce);
+				$world->setBlockAt($x, $y, $z, $targetBlock);
 			}
 		}
 	}
@@ -915,12 +933,12 @@ abstract class Living extends Entity{
 	 * their heads to turn.
 	 */
 	public function lookAt(Vector3 $target) : void{
-		$horizontal = sqrt(($target->x - $this->location->x) ** 2 + ($target->z - $this->location->z) ** 2);
-		$vertical = $target->y - ($this->location->y + $this->getEyeHeight());
-		$pitch = -atan2($vertical, $horizontal) / M_PI * 180; //negative is up, positive is down
-
 		$xDist = $target->x - $this->location->x;
 		$zDist = $target->z - $this->location->z;
+
+		$horizontal = sqrt($xDist ** 2 + $zDist ** 2);
+		$vertical = $target->y - ($this->location->y + $this->getEyeHeight());
+		$pitch = -atan2($vertical, $horizontal) / M_PI * 180; //negative is up, positive is down
 
 		$yaw = atan2($zDist, $xDist) / M_PI * 180 - 90;
 		if($yaw < 0){

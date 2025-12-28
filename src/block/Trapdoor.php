@@ -23,6 +23,7 @@ declare(strict_types=1);
 
 namespace pocketmine\block;
 
+use pocketmine\block\utils\HorizontalFacing;
 use pocketmine\block\utils\HorizontalFacingTrait;
 use pocketmine\block\utils\SupportType;
 use pocketmine\data\runtime\RuntimeDataDescriber;
@@ -34,7 +35,7 @@ use pocketmine\player\Player;
 use pocketmine\world\BlockTransaction;
 use pocketmine\world\sound\DoorSound;
 
-class Trapdoor extends Transparent{
+class Trapdoor extends Transparent implements HorizontalFacing{
 	use HorizontalFacingTrait;
 
 	protected bool $open = false;
@@ -63,7 +64,8 @@ class Trapdoor extends Transparent{
 	}
 
 	protected function recalculateCollisionBoxes() : array{
-		return [AxisAlignedBB::one()->trim($this->open ? $this->facing : ($this->top ? Facing::DOWN : Facing::UP), 13 / 16)];
+		//TODO: like doors, these are slightly too thin in Bugrock (0.1825 instead of 0.1875)
+		return [AxisAlignedBB::one()->trim($this->open ? $this->facing : ($this->top ? Facing::DOWN : Facing::UP), 1 - 0.1825)];
 	}
 
 	public function getSupportType(int $facing) : SupportType{

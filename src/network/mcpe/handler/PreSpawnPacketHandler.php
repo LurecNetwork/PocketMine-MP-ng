@@ -46,7 +46,9 @@ use pocketmine\network\mcpe\protocol\types\SpawnSettings;
 use pocketmine\player\Player;
 use pocketmine\Server;
 use pocketmine\timings\Timings;
+use pocketmine\VersionInfo;
 use Ramsey\Uuid\Uuid;
+use function sprintf;
 
 /**
  * Handler used for the pre-spawn phase of the session.
@@ -82,7 +84,8 @@ class PreSpawnPacketHandler extends PacketHandler{
 			$levelSettings->lightningLevel = 0;
 			$levelSettings->commandsEnabled = true;
 			$levelSettings->gameRules = [
-				"naturalregeneration" => new BoolGameRule(false, false) //Hack for client side regeneration
+				"naturalregeneration" => new BoolGameRule(false, false), //Hack for client side regeneration
+				"locatorbar" => new BoolGameRule(false, false) //Disable client-side tracking of nearby players
 			];
 			$levelSettings->experiments = new Experiments([], false);
 
@@ -99,13 +102,14 @@ class PreSpawnPacketHandler extends PacketHandler{
 				$this->server->getMotd(),
 				"",
 				false,
-				new PlayerMovementSettings(ServerAuthMovementMode::SERVER_AUTHORITATIVE_V2, 0, false),
+				new PlayerMovementSettings(ServerAuthMovementMode::SERVER_AUTHORITATIVE_V3, 0, true),
 				0,
 				0,
 				"",
 				true,
-				"NetherGames v5.0",
+				sprintf("%s %s", VersionInfo::NAME, VersionInfo::VERSION()->getFullVersion(true)),
 				Uuid::fromString(Uuid::NIL),
+				false,
 				false,
 				false,
 				new NetworkPermissions(disableClientSounds: true),

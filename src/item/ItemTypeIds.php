@@ -334,14 +334,36 @@ final class ItemTypeIds{
 	public const RECORD_CREATOR = 20295;
 	public const RECORD_CREATOR_MUSIC_BOX = 20296;
 	public const RECORD_PRECIPICE = 20297;
-	public const FIREWORK_ROCKET = 20298;
-	public const FIREWORK_STAR = 20299;
-	public const CROSSBOW = 20300;
-	public const ELYTRA = 20301;
-	public const TRIDENT = 20302;
-	public const SHIELD = 20303;
+	public const OMINOUS_BANNER = 20298;
+	public const ACACIA_HANGING_SIGN = 20299;
+	public const BIRCH_HANGING_SIGN = 20300;
+	public const CHERRY_HANGING_SIGN = 20301;
+	public const CRIMSON_HANGING_SIGN = 20302;
+	public const DARK_OAK_HANGING_SIGN = 20303;
+	public const JUNGLE_HANGING_SIGN = 20304;
+	public const MANGROVE_HANGING_SIGN = 20305;
+	public const OAK_HANGING_SIGN = 20306;
+	public const PALE_OAK_HANGING_SIGN = 20307;
+	public const SPRUCE_HANGING_SIGN = 20308;
+	public const WARPED_HANGING_SIGN = 20309;
+	public const TRIDENT = 20310;
+	public const FIREWORK_ROCKET = 20311;
+	public const FIREWORK_STAR = 20312;
+	public const COPPER_BOOTS = 20313;
+	public const COPPER_CHESTPLATE = 20314;
+	public const COPPER_HELMET = 20315;
+	public const COPPER_LEGGINGS = 20316;
+	public const COPPER_NUGGET = 20317;
+	public const COPPER_AXE = 20318;
+	public const COPPER_HOE = 20319;
+	public const COPPER_PICKAXE = 20320;
+	public const COPPER_SHOVEL = 20321;
+	public const COPPER_SWORD = 20322;
+	public const CROSSBOW = 20323;
+	public const ELYTRA = 20324;
+	public const SHIELD = 20325;
 
-	public const FIRST_UNUSED_ITEM_ID = 20304;
+	public const FIRST_UNUSED_ITEM_ID = 20326;
 
 	private static int $nextDynamicId = self::FIRST_UNUSED_ITEM_ID;
 
